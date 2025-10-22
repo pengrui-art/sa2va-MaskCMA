@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from third_parts.mmdet.models.losses import CrossEntropyLoss
+from projects.llava_sam2.utils.losses import masked_avg_pool, tmc_loss, boundary_loss
 
 from xtuner.registry import BUILDER
 from xtuner.model.utils import get_peft_model_state_dict
@@ -67,6 +68,16 @@ class VideoLLaVASAMModel(LisaModel):
         preprocessor=None,
         # bs
         bs: int = 0,
+        # Phase 2 loss weights (optional; default 0 for no behavior change)
+        loss_tmc_weight: float = 0.0,
+        loss_boundary_weight: float = 0.0,
+        # TMC options
+        tmc_temperature: float = 0.07,
+        tmc_use_gt_mask: bool = False,
+        tmc_detach_visual: bool = False,
+        tmc_use_pre_cma_feat: bool = True,
+        # Aux loss warmup (applied via hook)
+        aux_loss_warmup_ratio: float = 0.0,
     ):
         super(LisaModel, self).__init__()
         self.split_model = split_model
@@ -171,6 +182,17 @@ class VideoLLaVASAMModel(LisaModel):
         self.num_points = num_points
         self.oversample_ratio = 3.0
         self.importance_sample_ratio = 0.75
+        # Phase 2 loss weights
+        self.loss_tmc_weight = float(loss_tmc_weight)
+        self.loss_boundary_weight = float(loss_boundary_weight)
+        # TMC options
+        self.tmc_temperature = float(tmc_temperature)
+        self.tmc_use_gt_mask = bool(tmc_use_gt_mask)
+        self.tmc_detach_visual = bool(tmc_detach_visual)
+        self.tmc_use_pre_cma_feat = bool(tmc_use_pre_cma_feat)
+        # Aux warmup scale maintained at runtime by hook
+        self._aux_loss_warmup_scale = 1.0
+        self.aux_loss_warmup_ratio = float(aux_loss_warmup_ratio)
 
         if fast_pool:
             self.fast_token_idx = self.tokenizer(
@@ -291,7 +313,6 @@ class VideoLLaVASAMModel(LisaModel):
         to_return.update(
             {k: v for k, v in state_dict.items() if "model.multi_modal_projector." in k}
         )
-
         # Step 4. mask decoder of grounding model (SAM/SAM2)
         to_return.update({k: v for k, v in state_dict.items() if "mask_decoder" in k})
         # Save CMA weights if present
@@ -448,9 +469,20 @@ class VideoLLaVASAMModel(LisaModel):
         sam_states = self.grounding_encoder.get_sam2_embeddings(
             g_pixel_values, expand_size=num_objs
         )
-        pred_masks = self.grounding_encoder.inject_language_embd(
-            sam_states, language_embeddings, nf_nobj=(num_frames, num_objs)
-        )
+        # For Phase 2, request low-res backbone feature if we need TMC
+        need_lowres_feat = self.loss_tmc_weight > 0
+        if need_lowres_feat:
+            pred_masks, lowres_feat = self.grounding_encoder.inject_language_embd(
+                sam_states,
+                language_embeddings,
+                nf_nobj=(num_frames, num_objs),
+                return_lowres_feat=True,
+                lowres_feat_stage=("pre" if self.tmc_use_pre_cma_feat else "post"),
+            )
+        else:
+            pred_masks = self.grounding_encoder.inject_language_embd(
+                sam_states, language_embeddings, nf_nobj=(num_frames, num_objs)
+            )
 
         gt_masks = [
             F.interpolate(
@@ -490,6 +522,52 @@ class VideoLLaVASAMModel(LisaModel):
         loss_mask += sam_loss_mask
         loss_dice += sam_loss_dice
 
+        # -------------------- Phase 2: optional auxiliary losses --------------------
+        aux_losses = {}
+        aux_scale = getattr(self, "_aux_loss_warmup_scale", 1.0)
+        if seg_valid:
+            # Boundary-aware loss
+            if self.loss_boundary_weight > 0.0:
+                b_loss = boundary_loss(pred_masks, gt_masks)
+                aux_losses["loss_boundary"] = (
+                    b_loss * self.loss_boundary_weight * aux_scale
+                )
+
+            # Text–Mask Contrastive loss (TMC): pool visual features in predicted/gt regions and align with text tokens
+            if self.loss_tmc_weight > 0.0 and need_lowres_feat:
+                try:
+                    # lowres_feat: (N_total, C, H, W)
+                    nf, nobj, Hm, Wm = pred_masks.shape
+                    N_total = nf * nobj
+                    masks_flat = (
+                        gt_masks.reshape(N_total, Hm, Wm)
+                        if self.tmc_use_gt_mask
+                        else pred_masks.reshape(N_total, Hm, Wm)
+                    )
+
+                    # Ensure lowres_feat matches N_total; if not, try expand or fallback
+                    if lowres_feat.dim() == 4 and lowres_feat.size(0) == N_total:
+                        v_feat = (
+                            lowres_feat.detach()
+                            if self.tmc_detach_visual
+                            else lowres_feat
+                        )
+                        vis_roi = masked_avg_pool(v_feat, masks_flat)  # (N_total, C)
+                        # Prepare text features aligned to objects per frame (same order used to expand SAM features)
+                        text_per_frame = language_embeddings.reshape(
+                            nf, nobj, -1
+                        )  # (nf, nobj, C)
+                        text_flat = text_per_frame.reshape(N_total, -1)
+                        c_loss = tmc_loss(
+                            vis_roi, text_flat, temperature=self.tmc_temperature
+                        )
+                        aux_losses["loss_tmc"] = (
+                            c_loss * self.loss_tmc_weight * aux_scale
+                        )
+                except Exception:
+                    # Be conservative: skip TMC if any mismatch occurs
+                    pass
+
         if not seg_valid:
             _scale = 0.0
         else:
@@ -502,6 +580,9 @@ class VideoLLaVASAMModel(LisaModel):
             "loss_dice": loss_dice,
             "llm_loss": output.loss,
         }
+        # merge aux losses
+        for k, v in aux_losses.items():
+            loss_dict[k] = v
         if loss_exists is not None:
             loss_dict["loss_exists"] = loss_exists
         return loss_dict
@@ -891,6 +972,7 @@ class VideoLLaVASAMModel_zero3(VideoLLaVASAMModel):
         arch_type="intern_vl",
         # zero3
         bs=1,
+        **kwargs,
     ):
         super(VideoLLaVASAMModel_zero3, self).__init__(
             mllm=mllm,
@@ -908,6 +990,7 @@ class VideoLLaVASAMModel_zero3(VideoLLaVASAMModel):
             fast_pool=fast_pool,
             fast_pool_size=fast_pool_size,
             arch_type=arch_type,
+            **kwargs,
         )
         self.bs = bs
 

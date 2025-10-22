@@ -117,7 +117,9 @@ class SAM2TrainRunner(BaseModule):
 
     def set_cma_warmup_scale(self, scale: float):
         """Externally control CMA residual strength (e.g., during LR warmup)."""
-        if getattr(self, "cma", None) is not None and hasattr(self.cma, "set_warmup_scale"):
+        if getattr(self, "cma", None) is not None and hasattr(
+            self.cma, "set_warmup_scale"
+        ):
             self.cma.set_warmup_scale(scale)
 
     def preprocess_image(self, image: torch.Tensor) -> torch.Tensor:
@@ -132,7 +134,14 @@ class SAM2TrainRunner(BaseModule):
         image /= img_std
         return image
 
-    def inject_language_embd(self, sam_states, language_embd, nf_nobj=None):
+    def inject_language_embd(
+        self,
+        sam_states,
+        language_embd,
+        nf_nobj=None,
+        return_lowres_feat: bool = False,
+        lowres_feat_stage: str = "post",
+    ):
         high_res_features = [
             x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
             for x, s in zip(
@@ -155,7 +164,9 @@ class SAM2TrainRunner(BaseModule):
                 "directly add no memory embedding is not implemented"
             )
 
-    # Optionally apply cross-modal attention to inject language guidance
+        pre_cma_feat = pix_feat_with_mem
+
+        # Optionally apply cross-modal attention to inject language guidance
         if self.enable_cma and self.cma is not None and language_embd is not None:
             # language_embd expected shapes:
             # - (nf, nobj, C) flattened later, or
@@ -176,7 +187,9 @@ class SAM2TrainRunner(BaseModule):
                     try:
                         idx = lvl if lvl >= 0 else (len(high_res_features) + lvl)
                         if 0 <= idx < len(high_res_features):
-                            high_res_features[idx] = self.cma(high_res_features[idx], lang_feats)
+                            high_res_features[idx] = self.cma(
+                                high_res_features[idx], lang_feats
+                            )
                     except Exception:
                         # be robust: skip if shape/dtype mismatch occurs
                         pass
@@ -226,12 +239,21 @@ class SAM2TrainRunner(BaseModule):
                 # Inject language Embed if possible
                 language_embd=language_embd,
             )
+            # Expose the low-res feature that produced low_res_masks if requested.
+            if return_lowres_feat:
+                lowres_feat = (
+                    pre_cma_feat if lowres_feat_stage == "pre" else pix_feat_with_mem
+                )
+            else:
+                lowres_feat = None
 
         if nf_nobj is not None:
             pred_masks = low_res_masks.squeeze(1)
             pred_masks = pred_masks.unflatten(0, nf_nobj)
         else:
             pred_masks = low_res_masks
+        if return_lowres_feat:
+            return pred_masks, lowres_feat
         return pred_masks
 
     def get_sam2_embeddings(self, images, expand_size=1):

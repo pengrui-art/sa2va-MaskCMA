@@ -47,8 +47,10 @@ from projects.llava_sam2.datasets import ReferSegmDataset
 from projects.llava_sam2.models.preprocess.image_resize import DirectResize
 from projects.llava_sam2.utils.rank_logging import PerRankLogHook
 from projects.llava_sam2.utils.resume_progress import ResumeProgressHook
+
 # Ensure module is importable when config is executed directly.
 from projects.llava_sam2.utils.cma_warmup_hook import CMAWarmupHook
+from projects.llava_sam2.utils.aux_warmup_hook import AuxLossWarmupHook
 
 # Make sure custom hooks/modules are imported so they register with MMEngine
 # See: https://mmengine.readthedocs.io/en/latest/advanced_tutorials/config.html#import-the-custom-module
@@ -56,6 +58,7 @@ from projects.llava_sam2.utils.cma_warmup_hook import CMAWarmupHook
 custom_imports = dict(
     imports=[
         "projects.llava_sam2.utils.cma_warmup_hook",
+        "projects.llava_sam2.utils.aux_warmup_hook",
         "projects.llava_sam2.utils",
         "projects.llava_sam2",
     ],
@@ -136,10 +139,10 @@ model = dict(
         # CMAP: multi-token + routing + FiLM (all training-only friendly)
         cma_use_multi_token=True,
         cma_topk_tokens=2,
-    cma_use_film=True,
-    cma_dropout=0.1,
-    # Slightly higher dropout for FiLM branch to stabilize early training
-    cma_film_dropout=0.1,
+        cma_use_film=True,
+        cma_dropout=0.1,
+        # Slightly higher dropout for FiLM branch to stabilize early training
+        cma_film_dropout=0.1,
         # Optional: also inject on one high-res level (weakly)
         # Phase 0: disable high-res CMA to avoid early over-conditioning
         cma_apply_on_highres=False,
@@ -157,6 +160,15 @@ model = dict(
         eps=1.0,
         loss_weight=0.5,
     ),
+    # Phase 2 optional losses (default disabled)
+    loss_tmc_weight=0.0,
+    loss_boundary_weight=0.0,
+    # TMC options and warmup
+    tmc_temperature=0.15,
+    tmc_use_gt_mask=True,
+    tmc_detach_visual=True,
+    tmc_use_pre_cma_feat=True,
+    aux_loss_warmup_ratio=0.2,
     pretrained_pth=pretrained_pth,
     loss_sample_points=True,
     # loss_sample_points=False,
@@ -570,6 +582,8 @@ custom_hooks = [
     # dict(type=DatasetInfoHook, tokenizer=tokenizer),
     # Gradually ramp up CMA residual strength to stabilize early training
     dict(type=CMAWarmupHook, warmup_ratio=0.1),
+    # Optional: Warm up auxiliary losses (TMC/boundary)
+    # dict(type=AuxLossWarmupHook, warmup_ratio=0.2),
     dict(
         type=PerRankLogHook,
         log_subdir="rank_logs",
